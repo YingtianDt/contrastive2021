@@ -81,6 +81,109 @@ class BenchmarkModule(pl.LightningModule):
             # self.log('kNN_accuracy', acc * 100.0, prog_bar=True)
 
 
+class BootstrapModel(BenchmarkModule):
+    def __init__(self, dataloader_kNN, epochs):
+        super().__init__(dataloader_kNN, epochs)
+        # create a ResNet backbone and remove the classification head
+        resnet = lightly.models.ResNetGenerator('resnet-9')
+        self.backbone1 = nn.Sequential(
+            *list(resnet.children())[:3],
+        )
+        resnet = lightly.models.ResNetGenerator('resnet-9')
+        self.backbone2 = nn.Sequential(
+            *list(resnet.children())[:3],
+        )
+        self.top = nn.Sequential(
+            *list(resnet.children())[3:-1],
+            nn.AdaptiveAvgPool2d(1)
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        # create a simclr model based on ResNet
+        self.resnet_simclr = \
+            lightly.models.SimCLR(self.backbone, num_ftrs=512)  # add a 2-layer projection head
+        self.criterion = lightly.loss.NTXentLoss()
+
+    def forward(self, x):
+        x = self.backbone1(x)
+        return self.top(x)
+
+    def training_step(self, batch, batch_idx):
+        x0, _ = batch
+        x0, x1 = self.backbone1(x0), self.backbone2(x0)
+        f0 = self.pool(x0)
+        f1 = self.pool(x1)
+        x0, x1 = self.top(x0), self.top(x1)
+        x0, x1, f0, f1 = x0[...,0,0], x1[...,0,0], f0[...,0,0], f1[...,0,0]
+        loss = self.criterion(x0, x1) - self.criterion(f0, f1)
+        self.log('train_loss_ssl', loss)
+        return loss
+
+    def configure_optimizers(self):
+        optim = torch.optim.SGD(
+            self.resnet_simclr.parameters(),
+            lr=6e-2,
+            momentum=0.9,
+            weight_decay=5e-4
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim, self.epochs)
+        return [optim], [scheduler]
+
+    def training_epoch_end(self, outputs):
+        # print losses
+        losses = [i['loss'].item() for i in outputs]
+        loss_avg = sum(losses)/len(losses)
+        print(f'Epoch {self.current_epoch+1}/{self.epochs}: train loss = {loss_avg:.2f}')
+
+        # update feature bank at the end of each training epoch
+        self.backbone.eval()
+        self.feature_bank = []
+        self.targets_bank = []
+        with torch.no_grad():
+            for data in self.dataloader_kNN:
+                img, target = data
+                if torch.cuda.is_available():
+                    img = img.cuda()
+                    target = target.cuda()
+                feature = self.backbone1(img)
+                feature = self.top(feature)[..., 0, 0]
+                feature = F.normalize(feature, dim=1)
+                self.feature_bank.append(feature)
+                self.targets_bank.append(target)
+        self.feature_bank = torch.cat(
+            self.feature_bank, dim=0).t().contiguous()
+        self.targets_bank = torch.cat(
+            self.targets_bank, dim=0).t().contiguous()
+        self.backbone.train()
+
+    def validation_step(self, batch, batch_idx):
+        # we can only do kNN predictions once we have a feature bank
+        if hasattr(self, 'feature_bank') and hasattr(self, 'targets_bank'):
+            images, targets = batch
+            feature = self.backbone1(images)
+            feature = self.top(feature)[..., 0, 0]
+            feature = F.normalize(feature, dim=1)
+            pred_labels = knn_predict(
+                feature, self.feature_bank, self.targets_bank, classes, knn_k, knn_t)
+            num = images.size(0)
+            top1 = (pred_labels[:, 0] == targets).float().sum().item()
+            return (num, top1)
+
+    def validation_epoch_end(self, outputs):
+        if outputs:
+            total_num = 0
+            total_top1 = 0.
+            for (num, top1) in outputs:
+                total_num += num
+                total_top1 += top1
+            acc = float(total_top1 / total_num)
+            if acc > self.max_accuracy:
+                self.max_accuracy = acc
+            print(f'Epoch {self.current_epoch+1}/{self.epochs}: KNN acc = {100*acc:.2f}')
+            # self.log('kNN_accuracy', acc * 100.0, prog_bar=True)
+
+
+
 class SimCLRModel(BenchmarkModule):
     def __init__(self, dataloader_kNN, epochs):
         super().__init__(dataloader_kNN, epochs)
